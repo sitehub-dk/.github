@@ -1,0 +1,190 @@
+name: security-baseline
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "20"
+      run-codeql:
+        type: boolean
+        default: true
+      run-snyk:
+        type: boolean
+        default: true
+    secrets:
+      SNYK_TOKEN:
+        required: false
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  detect:
+    name: detect ecosystem
+    runs-on: ubuntu-latest
+    outputs:
+      pkg-manager: ${{ steps.detect.outputs.pkg-manager }}
+      has-package-json: ${{ steps.detect.outputs.has-package-json }}
+      languages: ${{ steps.detect.outputs.languages }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          set -e
+          pm=""
+          if [[ -f bun.lock || -f bun.lockb ]]; then pm=bun
+          elif [[ -f pnpm-lock.yaml ]]; then pm=pnpm
+          elif [[ -f yarn.lock ]]; then pm=yarn
+          elif [[ -f package-lock.json ]]; then pm=npm
+          fi
+          echo "pkg-manager=$pm" >> "$GITHUB_OUTPUT"
+          [[ -f package.json ]] && echo "has-package-json=true" >> "$GITHUB_OUTPUT" || echo "has-package-json=false" >> "$GITHUB_OUTPUT"
+          langs="[]"
+          [[ -f package.json ]] && langs='["javascript-typescript"]'
+          [[ -f go.mod ]] && langs='["javascript-typescript","go"]'
+          [[ -f Cargo.toml ]] && langs='["javascript-typescript","rust"]'
+          [[ -f pyproject.toml || -f requirements.txt ]] && langs='["javascript-typescript","python"]'
+          echo "languages=$langs" >> "$GITHUB_OUTPUT"
+
+  pin-check:
+    name: pin-check (no ^/~ in package.json)
+    needs: detect
+    if: needs.detect.outputs.has-package-json == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          node -e '
+            const p = require("./package.json");
+            let bad = [];
+            for (const k of ["dependencies","devDependencies","peerDependencies"]) {
+              for (const [n, v] of Object.entries(p[k] || {})) {
+                if (typeof v !== "string") continue;
+                if (v.startsWith("workspace:") || v.startsWith("link:") || v.startsWith("file:") ||
+                    v.startsWith("git:") || v.startsWith("git+") || v.startsWith("github:") ||
+                    v.startsWith("http:") || v.startsWith("https:") || v.startsWith("npm:")) continue;
+                if (/[\^~]/.test(v)) bad.push(`${k}.${n}=${v}`);
+              }
+            }
+            if (bad.length) {
+              console.error("Unpinned dependencies (must use exact version, no ^ or ~):");
+              for (const b of bad) console.error("  " + b);
+              process.exit(1);
+            }
+            console.log("All deps pinned.");
+          '
+
+  audit:
+    name: ${{ needs.detect.outputs.pkg-manager }} audit
+    needs: detect
+    if: needs.detect.outputs.pkg-manager != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: npm audit
+        if: needs.detect.outputs.pkg-manager == 'npm'
+        run: npm audit --audit-level=high
+      - name: pnpm audit
+        if: needs.detect.outputs.pkg-manager == 'pnpm'
+        run: |
+          npm install -g pnpm
+          pnpm audit --audit-level high
+      - name: yarn audit
+        if: needs.detect.outputs.pkg-manager == 'yarn'
+        run: yarn npm audit --severity high
+      - name: bun audit
+        if: needs.detect.outputs.pkg-manager == 'bun'
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          export PATH="$HOME/.bun/bin:$PATH"
+          bun audit
+
+  safe-chain-scan:
+    name: Aikido safe-chain
+    needs: detect
+    if: needs.detect.outputs.has-package-json == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true   # informational while we tune false-positive rate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: ${{ inputs.node-version }} }
+      - run: |
+          npm install -g @aikidosec/safe-chain || echo "safe-chain unavailable; skipping"
+          # safe-chain wraps npm; running an audit pass triggers its check against the known-bad list
+          (npx --no-install safe-chain audit 2>&1 || true) | tee safe-chain.log
+          if grep -qi 'BLOCKED\|MALICIOUS\|COMPROMISED' safe-chain.log; then
+            echo "::error::Aikido safe-chain detected a known-bad package."
+            exit 1
+          fi
+
+  dependency-review:
+    name: dependency-review (PR-time vuln block)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  snyk:
+    name: Snyk test
+    needs: detect
+    if: needs.detect.outputs.has-package-json == 'true' && inputs.run-snyk
+    runs-on: ubuntu-latest
+    continue-on-error: true   # soft-fail until SNYK_TOKEN is in 1Password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load secret from 1Password (optional)
+        if: secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          SNYK_TOKEN: op://Infrastructure/SNYK_TOKEN/credential
+      - name: Use repo SNYK_TOKEN if 1P not available
+        if: env.SNYK_TOKEN == '' && secrets.SNYK_TOKEN != ''
+        run: echo "SNYK_TOKEN=${{ secrets.SNYK_TOKEN }}" >> $GITHUB_ENV
+      - if: env.SNYK_TOKEN != ''
+        uses: snyk/actions/node@master
+        with:
+          args: --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+
+  codeql:
+    name: CodeQL
+    needs: detect
+    if: inputs.run-codeql && needs.detect.outputs.languages != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.detect.outputs.languages) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: ${{ matrix.language }} }
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  secret-scan-summary:
+    name: open secret-scan alerts
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: |
+          gh api "repos/${{ github.repository }}/secret-scanning/alerts?state=open" \
+            --jq 'length as $n | if $n == 0 then "no open secret-scanning alerts" else "OPEN ALERTS: \($n)" end'
+        env:
+          GH_TOKEN: ${{ github.token }}
