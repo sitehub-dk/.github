@@ -23,7 +23,7 @@ We patch the `main` / `master` / `develop` branch and the most recent release br
 Every sitehub-dk repo runs the org-default security baseline:
 
 - **Dependabot alerts** + automated security fixes
-- **Secret scanning + push protection** (GHAS) with custom patterns for our token formats (HETZNER, PROXMOX, ECONOMIC, etc.)
+- **Secret scanning + push protection** (GHAS) with custom patterns registered for our internal token formats
 - **CodeQL** code scanning where the language is supported
 - **Dependency Review** on every PR — blocks vulnerable deps at PR time
 - **Branch protection** on default: PR required, 1 approving review, no force push, no deletion

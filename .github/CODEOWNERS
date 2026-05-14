@@ -1,11 +1,3 @@
-# Default reviewers for the org-default .github files.
-# Per-repo CODEOWNERS take precedence.
-
-# Default owner of org-wide security policy
-*                       @sitehub-dk/security-admins
-
-# Security-sensitive files require security-admins review
-SECURITY.md             @sitehub-dk/security-admins
-.github/dependabot.yml  @sitehub-dk/security-admins
-.github/workflows/      @sitehub-dk/security-admins
-secret_scanning_patterns.yml  @sitehub-dk/security-admins
+# Default reviewers for this org-default repo.
+# Per-repo CODEOWNERS in consuming repos take precedence.
+* @MasterST1337 @b3rntsen
