@@ -1,0 +1,7 @@
+.codegraph/
+
+# Hygiene additions
+.env
+node_modules/
+dist/
+__pycache__/
